@@ -4,6 +4,7 @@ use bincode::{Decode, Encode};
 use chrono::{Datelike, Month, NaiveDate, NaiveDateTime};
 use language::Language;
 use serde::{Deserialize, Serialize};
+use serde_json::value::Value;
 use crate::deprecated::projects::data_storage::{BiographyV1, OldLanguage};
 
 /// Struct holds all project-level settings
@@ -61,9 +62,12 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for BiographyV2 {
     }
 }
 
-pub type Person = PersonV2;
+pub type Person = PersonV3;
 
-/// Struct holds all data for a person (e.g. author or editor)
+/// Struct holds all data for a person (e.g. author or editor).
+///
+/// Superseded by [`PersonV3`]; kept because old `data.*.bincode` files (the legacy
+/// storage migration) still contain this layout.
 #[derive(Deserialize, Serialize, Debug, Encode, Decode, Clone, PartialEq)]
 pub struct PersonV2 {
     #[bincode(with_serde)]
@@ -76,18 +80,87 @@ pub struct PersonV2 {
     pub ror: Option<Identifier>,
 }
 
+/// Who a [`PersonV3`] belongs to: a team's shared person library, or a single project.
+///
+/// Only persons stored in the `persons` table have a scope. Free-text names
+/// ([`PersonOrString::NameString`]) are always project-local and have no scope.
+#[derive(Deserialize, Serialize, Debug, Encode, Decode, Clone, Copy, PartialEq, Eq)]
+pub enum PersonScope {
+    Team(#[bincode(with_serde)] uuid::Uuid),
+    Project(#[bincode(with_serde)] uuid::Uuid),
+}
+
+/// Struct holds all data for a person (e.g. author or editor)
+#[derive(Deserialize, Serialize, Debug, Encode, Decode, Clone, PartialEq)]
+pub struct PersonV3 {
+    #[bincode(with_serde)]
+    pub id: Option<uuid::Uuid>,
+    pub first_names: Option<String>,
+    pub last_names: String,
+    pub orcid: Option<Identifier>,
+    pub gnd: Option<Identifier>,
+    pub bios: Option<Vec<Biography>>,
+    pub ror: Option<Identifier>,
+    /// `None` when unspecified (e.g. converted from an older version). Required when
+    /// creating a person; ignored on updates, since a person's scope only changes by promotion.
+    #[serde(default)]
+    pub scope: Option<PersonScope>,
+}
+
+/// Drops the scope, for the wire format ([`PersonOrString`]) that predates it.
+impl From<PersonV3> for PersonV2 {
+    fn from(person: PersonV3) -> Self {
+        Self {
+            id: person.id,
+            first_names: person.first_names,
+            last_names: person.last_names,
+            orcid: person.orcid,
+            gnd: person.gnd,
+            bios: person.bios,
+            ror: person.ror,
+        }
+    }
+}
+
+impl From<PersonV2> for PersonV3 {
+    fn from(person: PersonV2) -> Self {
+        Self {
+            id: person.id,
+            first_names: person.first_names,
+            last_names: person.last_names,
+            orcid: person.orcid,
+            gnd: person.gnd,
+            bios: person.bios,
+            ror: person.ror,
+            scope: None,
+        }
+    }
+}
+
 /// The `persons` table only stores each identifier's `.value` (its `id`/`name` are
 /// regenerated on every load, same lossiness the manual mapping this replaces already had),
 /// and `bios` lives in a separate `biographies` table joined per-row — always `None` here;
 /// callers that need biographies fetch them separately and fill the field in afterward.
+/// The scope is derived from the `owner_team_id` / `project_id` columns (exactly one is set).
 #[cfg(feature = "sqlx")]
-impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PersonV2 {
+impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PersonV3 {
     fn from_row(row: &'r sqlx::postgres::PgRow) -> sqlx::Result<Self> {
         use sqlx::Row;
         let orcid: Option<String> = row.try_get("orcid")?;
         let gnd: Option<String> = row.try_get("gnd")?;
         let ror: Option<String> = row.try_get("ror")?;
-        Ok(PersonV2 {
+        let owner_team_id: Option<uuid::Uuid> = row.try_get("owner_team_id")?;
+        let project_id: Option<uuid::Uuid> = row.try_get("project_id")?;
+        let scope = match (owner_team_id, project_id) {
+            (Some(team_id), None) => PersonScope::Team(team_id),
+            (None, Some(project_id)) => PersonScope::Project(project_id),
+            _ => {
+                return Err(sqlx::Error::Decode(
+                    "person must have exactly one of owner_team_id and project_id".into(),
+                ));
+            }
+        };
+        Ok(PersonV3 {
             id: Some(row.try_get("id")?),
             first_names: row.try_get("first_names")?,
             last_names: row.try_get("last_names")?,
@@ -95,6 +168,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::postgres::PgRow> for PersonV2 {
             gnd: gnd.map(|value| Identifier::new(IdentifierType::GND, value, None)),
             ror: ror.map(|value| Identifier::new(IdentifierType::ROR, value, None)),
             bios: None,
+            scope: Some(scope),
         })
     }
 }
@@ -204,8 +278,9 @@ pub struct PreparedMetadata{
     pub edition: Option<String>,
     /// Publisher of the book
     pub publisher: Option<String>,
-    /// Optional custom fields
-    pub custom_fields: HashMap<String, String>,
+    /// Optional custom fields as JSON
+    #[bincode(with_serde)]
+    pub custom_fields: HashMap<String, Value>,
 }
 
 #[derive(Serialize, Deserialize, Encode, Decode)]
@@ -419,9 +494,15 @@ pub struct PreparedSectionMetadata{
     pub lang: Option<Language>,
 }
 
+/// An author/editor as sent to the rendering server and shown in API responses: either a stored
+/// person or a free-text name.
+///
+/// Deliberately holds a [`PersonV2`], not the current [`Person`]: this type is part of the
+/// bincode wire format to the rendering server, which doesn't know about (and doesn't need) a
+/// person's [`PersonScope`]. Convert with `PersonV2::from(person)`.
 #[derive(Deserialize, Serialize, Debug, Encode, Decode, Clone)]
 pub enum PersonOrString{
-    Person(Person),
+    Person(PersonV2),
     NameString(String)
 }
 
