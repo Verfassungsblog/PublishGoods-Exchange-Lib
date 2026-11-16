@@ -492,6 +492,9 @@ pub struct PreparedSectionMetadata{
     pub published: Option<DetailedDate>,
     #[bincode(with_serde)]
     pub lang: Option<Language>,
+    /// Optional custom fields as JSON
+    #[bincode(with_serde)]
+    pub custom_fields: HashMap<String, Value>,
 }
 
 /// An author/editor as sent to the rendering server and shown in API responses: either a stored
