@@ -232,6 +232,74 @@ pub enum IdentifierType{
     Other(String),
 }
 
+/// A map of arbitrary JSON values that can be sent over bincode.
+///
+/// bincode isn't self-describing, but [`Value`]'s `Deserialize` impl needs `deserialize_any`, so
+/// `#[bincode(with_serde)]` on a `HashMap<String, Value>` fails with `Serde(AnyNotSupported)`
+/// when decoding a non-empty map. This wrapper encodes every value as a JSON string instead.
+/// For serde it is transparent, so JSON output is identical to a plain `HashMap<String, Value>`.
+///
+/// An empty map encodes to the same bytes as an empty `HashMap`.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(transparent)]
+pub struct JsonMap(pub HashMap<String, Value>);
+
+impl Encode for JsonMap {
+    fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
+        let mut entries = HashMap::with_capacity(self.0.len());
+        for (key, value) in &self.0 {
+            let json = serde_json::to_string(value)
+                .map_err(|e| bincode::error::EncodeError::OtherString(e.to_string()))?;
+            entries.insert(key, json);
+        }
+        entries.encode(encoder)
+    }
+}
+
+impl<Context> Decode<Context> for JsonMap {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
+        let entries = HashMap::<String, String>::decode(decoder)?;
+        let mut map = HashMap::with_capacity(entries.len());
+        for (key, json) in entries {
+            let value = serde_json::from_str(&json)
+                .map_err(|e| bincode::error::DecodeError::OtherString(e.to_string()))?;
+            map.insert(key, value);
+        }
+        Ok(JsonMap(map))
+    }
+}
+
+impl<'de, Context> bincode::BorrowDecode<'de, Context> for JsonMap {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
+        <Self as Decode<Context>>::decode(decoder)
+    }
+}
+
+impl std::ops::Deref for JsonMap {
+    type Target = HashMap<String, Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for JsonMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<HashMap<String, Value>> for JsonMap {
+    fn from(map: HashMap<String, Value>) -> Self {
+        JsonMap(map)
+    }
+}
+
+impl From<JsonMap> for HashMap<String, Value> {
+    fn from(map: JsonMap) -> Self {
+        map.0
+    }
+}
+
 #[derive(Serialize, Deserialize, Encode, Decode)]
 pub struct PreparedProject{
     pub metadata: PreparedMetadata,
@@ -279,8 +347,7 @@ pub struct PreparedMetadata{
     /// Publisher of the book
     pub publisher: Option<String>,
     /// Optional custom fields as JSON
-    #[bincode(with_serde)]
-    pub custom_fields: HashMap<String, Value>,
+    pub custom_fields: JsonMap,
 }
 
 #[derive(Serialize, Deserialize, Encode, Decode)]
@@ -493,8 +560,7 @@ pub struct PreparedSectionMetadata{
     #[bincode(with_serde)]
     pub lang: Option<Language>,
     /// Optional custom fields as JSON
-    #[bincode(with_serde)]
-    pub custom_fields: HashMap<String, Value>,
+    pub custom_fields: JsonMap,
 }
 
 /// An author/editor as sent to the rendering server and shown in API responses: either a stored
@@ -566,4 +632,27 @@ pub enum BlockType{
     List,
     Quote,
     Image
+}
+
+#[cfg(test)]
+mod json_map_tests {
+    use super::*;
+
+    #[test]
+    fn json_map_bincode_roundtrip() {
+        let mut map = HashMap::new();
+        map.insert("a".to_string(), serde_json::json!({"x": [1, 2.5, null, "s"], "y": true}));
+        map.insert("b".to_string(), serde_json::json!("text"));
+        let map = JsonMap(map);
+        let bytes = bincode::encode_to_vec(&map, bincode::config::standard()).unwrap();
+        let (decoded, _): (JsonMap, _) = bincode::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(map, decoded);
+    }
+
+    #[test]
+    fn empty_json_map_matches_empty_hashmap_encoding() {
+        let a = bincode::encode_to_vec(JsonMap::default(), bincode::config::standard()).unwrap();
+        let b = bincode::encode_to_vec(HashMap::<String, String>::new(), bincode::config::standard()).unwrap();
+        assert_eq!(a, b);
+    }
 }
