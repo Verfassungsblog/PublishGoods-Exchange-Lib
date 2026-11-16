@@ -54,6 +54,9 @@ pub struct WeasyprintExportStep {
     pub output_file: String,
     /// PDF variant (e.g. PDF/A etc.)
     pub pdf_variant: Option<WeasyprintPDFVariant>,
+    /// Optional paths (relative to the export's working directory) of XMP metadata files,
+    /// each passed to Weasyprint via --xmp-metadata
+    pub xmp_metadata_files: Option<Vec<String>>,
 }
 
 /// PDF variants supported by Weasyprint (via --pdf-variant)
